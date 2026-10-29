@@ -33,7 +33,7 @@ PROFILE = os.path.join(PARENT, "chrome-profile")
 os.makedirs(LISTS_DIR, exist_ok=True)
 
 SKIP = "-- sla kaart over --"
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.1"
 INSTALLER_API = 99
 DELAY_MIN = 1
 DELAY_MAX = 10
