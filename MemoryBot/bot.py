@@ -1,0 +1,677 @@
+import os, sys, re, time, stat, platform, zipfile, shutil, ssl, subprocess, random
+import urllib.request, urllib.error
+from selenium import webdriver
+from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+
+try:
+    import certifi
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+except Exception:
+    ssl_ctx = ssl.create_default_context()
+
+FROZEN = getattr(sys, "frozen", False)
+if FROZEN:
+    RES = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    if sys.platform.startswith("win"):
+        PARENT = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "MemoryBot")
+    elif sys.platform == "darwin":
+        PARENT = os.path.expanduser("~/Library/Application Support/MemoryBot")
+    else:
+        PARENT = os.path.join(os.environ.get("XDG_DATA_HOME", os.path.expanduser("~/.local/share")), "memorybot")
+    BASE = os.path.join(PARENT, "app")
+else:
+    RES = os.path.dirname(os.path.abspath(__file__))
+    BASE = RES
+    PARENT = os.path.dirname(BASE)
+LISTS_DIR = os.path.join(BASE, "lists")
+PROFILE = os.path.join(PARENT, "chrome-profile")
+os.makedirs(LISTS_DIR, exist_ok=True)
+
+SKIP = "-- sla kaart over --"
+APP_VERSION = "1.0.1"
+INSTALLER_API = 99
+DELAY_MIN = 1
+DELAY_MAX = 10
+
+
+def seed_lists():
+    src = os.path.join(RES, "lists")
+    if src == LISTS_DIR or not os.path.isdir(src):
+        return
+    for root, dirs, files in os.walk(src):
+        rel = os.path.relpath(root, src)
+        out = os.path.join(LISTS_DIR, rel)
+        os.makedirs(out, exist_ok=True)
+        for f in files:
+            dst = os.path.join(out, f)
+            if not os.path.exists(dst):
+                shutil.copy2(os.path.join(root, f), dst)
+
+
+seed_lists()
+
+VERSION = "153.0.8010.52"
+DL_URL = "https://storage.googleapis.com/chrome-for-testing-public/{v}/{p}/{name}-{p}.zip"
+
+log = print
+ask_open = None
+ask_mc = None
+stop = None
+driver = None
+all_words = {}
+
+system = platform.system()
+machine = platform.machine().lower()
+arm = machine in ("arm64", "aarch64")
+if system == "Linux":
+    if arm:
+        raise RuntimeError("linux op arm wordt niet ondersteund (geen chrome for testing build)")
+    PLAT = "linux64"
+elif system == "Darwin":
+    PLAT = "mac-arm64" if arm else "mac-x64"
+elif system == "Windows":
+    PLAT = "win64" if sys.maxsize > 2**32 else "win32"
+else:
+    raise RuntimeError("niet ondersteund os: " + system)
+
+IS_WIN = PLAT.startswith("win")
+
+if PLAT.startswith("mac"):
+    CHROME_REL = os.path.join("Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
+elif IS_WIN:
+    CHROME_REL = "chrome.exe"
+else:
+    CHROME_REL = "chrome"
+
+CHROME_DIR = os.path.join(PARENT, "chrome-" + PLAT)
+DRIVER_DIR = os.path.join(PARENT, "chromedriver-" + PLAT)
+CHROME_BIN = os.path.join(CHROME_DIR, CHROME_REL)
+DRIVER_BIN = os.path.join(DRIVER_DIR, "chromedriver.exe" if IS_WIN else "chromedriver")
+
+
+class Stopped(Exception):
+    pass
+
+
+def check():
+    if stop.is_set():
+        raise Stopped()
+
+
+def pause(secs):
+    end = time.time() + secs
+    while time.time() < end:
+        check()
+        time.sleep(0.1)
+        
+def word_delay():
+    pause(random.uniform(DELAY_MIN, DELAY_MAX))
+
+
+def extract_zip(zip_path, dest):
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            target = os.path.join(dest, info.filename)
+            if info.is_dir():
+                os.makedirs(target, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            mode = info.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                if os.path.lexists(target):
+                    os.remove(target)
+                os.symlink(zf.read(info).decode(), target)
+                continue
+            with zf.open(info) as src, open(target, "wb") as out:
+                out.write(src.read())
+            if mode:
+                os.chmod(target, stat.S_IMODE(mode) | stat.S_IRUSR | stat.S_IWUSR)
+
+
+def download(name, check_path):
+    if os.path.exists(check_path):
+        return
+    url = DL_URL.format(v=VERSION, p=PLAT, name=name)
+    zip_path = os.path.join(PARENT, name + "-" + PLAT + ".zip")
+    log(name + " downloaden (eenmalig)...")
+
+    try:
+        resp = urllib.request.urlopen(url, context=ssl_ctx, timeout=60)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(
+            "download mislukt (" + str(e.code) + "). versie " + VERSION + " bestaat misschien niet meer. "
+            "zoek een nieuwe op https://googlechromelabs.github.io/chrome-for-testing/"
+            "known-good-versions-with-downloads.json en pas VERSION aan in bot.py"
+        )
+    except urllib.error.URLError as e:
+        raise RuntimeError("geen verbinding of certificaat probleem: " + str(e.reason))
+
+    total = int(resp.headers.get("Content-Length") or 0)
+    done = 0
+    mark = 0
+    with open(zip_path, "wb") as f:
+        while True:
+            chunk = resp.read(65536)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total > 0:
+                pct = done * 100 // total
+                if pct >= mark + 20:
+                    mark = pct - pct % 20
+                    log("  " + str(pct) + "%")
+    resp.close()
+
+    log(name + " uitpakken...")
+    extract_zip(zip_path, PARENT)
+    os.remove(zip_path)
+
+
+def ensure_browser():
+    download("chrome", CHROME_BIN)
+    download("chromedriver", DRIVER_BIN)
+    if not IS_WIN:
+        os.chmod(CHROME_BIN, 0o755)
+        os.chmod(DRIVER_BIN, 0o755)
+        helper = os.path.join(CHROME_DIR, "chrome_crashpad_handler")
+        if os.path.exists(helper):
+            os.chmod(helper, 0o755)
+
+
+def norm(s):
+    return " ".join(s.strip().lower().split())
+
+
+def natural(s):
+    return [int(t) if t.isdigit() else t for t in re.split(r"(\d+)", s.lower())]
+
+
+def load_list(path):
+    out = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            if "=" in line:
+                cue, ans = line.rsplit("=", 1)
+                out[norm(cue)] = ans.strip()
+    return out
+
+
+def find_lists():
+    found = []
+    for root, dirs, files in os.walk(LISTS_DIR):
+        dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+        for f in sorted(files):
+            if f.endswith(".txt"):
+                rel = os.path.relpath(os.path.join(root, f), LISTS_DIR)
+                found.append(rel.replace(os.sep, "/"))
+    return sorted(found, key=natural)
+
+
+def build_steps(names, start=1):
+    steps = []
+    for k in range(len(names)):
+        name = names[k]
+        card = start - 1 + k
+        if name == SKIP:
+            log("  kaart " + str(card + 1) + ": overgeslagen")
+            continue
+        words = load_list(os.path.join(LISTS_DIR, *name.split("/")))
+        label = os.path.splitext(os.path.basename(name))[0]
+        steps.append({"label": label, "card": card, "files": [name], "words": words})
+        log("  kaart " + str(card + 1) + ": " + name + " (" + str(len(words)) + " woorden)")
+    return steps
+
+
+def variants(s):
+    s = norm(s)
+    strip = lambda x: norm(re.sub(r"\([^)]*\)", "", x))
+    out = {s, strip(s)}
+    for part in re.split(r"[;,]", s):
+        p = norm(part)
+        out.add(p)
+        out.add(strip(p))
+    out.discard("")
+    return out
+
+
+def correct_targets(cue, d):
+    targets = set()
+    for k, v in d.items():
+        if cue in variants(k):
+            targets |= variants(v)
+        if cue in variants(v):
+            targets |= variants(k)
+    targets.discard(cue)
+    return targets
+
+
+def full_targets(cue, d):
+    out = set()
+    for k, v in d.items():
+        if cue in variants(k):
+            out.add(norm(v))
+        if cue in variants(v):
+            out.add(norm(k))
+    out.discard(cue)
+    return out
+
+
+def lookup(cue, dicts):
+    for d in dicts:
+        if cue in d:
+            return d[cue]
+    return None
+
+
+CUE = (By.CSS_SELECTOR, "h2#cue-text")
+ANSWER = (By.CSS_SELECTOR, ".answer-section input, .answer-section textarea")
+KNOW_BTN = (By.CSS_SELECTOR, "ion-button[data-test='register-study-trial']")
+NEXT_BTN = (By.CSS_SELECTOR, "ion-button[data-test='next-button']")
+MC_BTN = (By.CSS_SELECTOR, "ion-button[data-test^='multiple-choice-answer-']")
+MC_TEXT = (By.CSS_SELECTOR, "[data-test='mc-answer-text']")
+STOP_BTN = (By.CSS_SELECTOR, "ion-button[data-test='return-to-lesson']")
+BACK_BTN = (By.CSS_SELECTOR, "ion-back-button")
+LESSON_CARD = (By.CSS_SELECTOR, "app-lesson-card")
+CARD_INNER = (By.CSS_SELECTOR, "ion-card[data-test='lesson-card']")
+START_BTN = (By.CSS_SELECTOR, "app-split-button[data-test='start-button'] ion-button.main-button")
+
+
+def alive():
+    if driver is None:
+        return False
+    try:
+        driver.title
+        return True
+    except Exception:
+        return False
+
+
+def clean_locks():
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        p = os.path.join(PROFILE, name)
+        try:
+            if os.path.lexists(p):
+                os.remove(p)
+        except OSError:
+            pass
+
+
+def kill_old_chrome():
+    try:
+        if IS_WIN:
+            ps = (
+                "Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+                "Where-Object { $_.ExecutablePath -like '" + CHROME_DIR + "*' } | "
+                "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+            )
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW, timeout=20,
+            )
+        else:
+            subprocess.run(["pkill", "-f", CHROME_DIR], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except Exception:
+        pass
+
+
+def open_browser(url):
+    global driver
+    if not alive():
+        ensure_browser()
+        opts = Options()
+        opts.binary_location = CHROME_BIN
+        opts.add_argument("--user-data-dir=" + PROFILE)
+        last_err = None
+        for attempt in range(2):
+            kill_old_chrome()
+            clean_locks()
+            time.sleep(1)
+            service = Service(DRIVER_BIN, log_output=os.path.join(BASE, "chromedriver.log"))
+            try:
+                driver = webdriver.Chrome(service=service, options=opts)
+                last_err = None
+                break
+            except Exception as e:
+                driver = None
+                last_err = e
+                log("chrome start mislukt, opnieuw proberen...")
+        if last_err is not None:
+            raise RuntimeError(
+                "chrome starten mislukt. details in chromedriver.log (" + type(last_err).__name__ + ")"
+            )
+    driver.get(url)
+
+
+def close():
+    global driver
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        driver = None
+
+
+def click(el):
+    try:
+        el.click()
+    except StaleElementReferenceException:
+        raise
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
+
+
+def first_visible(locator):
+    for el in driver.find_elements(*locator):
+        try:
+            if el.is_displayed():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def know_button():
+    for b in driver.find_elements(*KNOW_BTN):
+        if b.is_displayed() and "ik ken het" in b.text.lower():
+            return b
+    return None
+
+
+def next_button():
+    for b in driver.find_elements(*NEXT_BTN):
+        try:
+            if not b.is_displayed():
+                continue
+            if b.get_attribute("disabled") is not None:
+                continue
+            if "button-disabled" in (b.get_attribute("class") or ""):
+                continue
+            return b
+        except StaleElementReferenceException:
+            continue
+    return None
+
+
+def stop_button():
+    return first_visible(STOP_BTN)
+
+
+def get_cue():
+    return driver.find_element(*CUE).text
+
+
+def in_exercise():
+    return bool(know_button()) or first_visible(CUE) is not None
+
+
+def mc_options():
+    out = []
+    for b in driver.find_elements(*MC_BTN):
+        try:
+            if not b.is_displayed():
+                continue
+            inner = b.find_elements(*MC_TEXT)
+            src = inner[0] if inner else b
+            text = src.text.strip() or (src.get_attribute("textContent") or "").strip()
+            out.append((b, text))
+        except StaleElementReferenceException:
+            continue
+    return out
+
+
+def pick_option(cue, options, dicts):
+    for d in dicts:
+        full = full_targets(cue, d)
+        for i in range(len(options)):
+            if norm(options[i][1]) in full:
+                return i
+    for d in dicts:
+        targets = correct_targets(cue, d)
+        best = None
+        best_score = 0
+        for i in range(len(options)):
+            score = len(variants(options[i][1]) & targets)
+            if score > best_score:
+                best = i
+                best_score = score
+        if best is not None:
+            return best
+    return None
+
+
+def visible_cards():
+    out = []
+    for card in driver.find_elements(*LESSON_CARD):
+        try:
+            if card.is_displayed():
+                out.append(card)
+        except StaleElementReferenceException:
+            continue
+    return out
+
+
+def card_title(card):
+    try:
+        t = card.find_element(By.CSS_SELECTOR, "h2").get_attribute("textContent").strip()
+        if t:
+            return t
+    except Exception:
+        pass
+    try:
+        return " ".join((card.get_attribute("textContent") or "").split())[:40] or "?"
+    except Exception:
+        return "?"
+
+
+def get_card(index, timeout=40):
+    end = time.time() + timeout
+    stuck = 0
+    count = -1
+    while time.time() < end:
+        check()
+        cards = visible_cards()
+        if len(cards) > index:
+            return cards[index], len(cards)
+        if len(cards) == count:
+            stuck += 1
+            if stuck >= 4:
+                break
+        else:
+            stuck = 0
+        count = len(cards)
+        if cards:
+            try:
+                driver.execute_script("arguments[0].scrollIntoView({block:'end'});", cards[-1])
+            except Exception:
+                pass
+        pause(0.7)
+    return None, len(visible_cards())
+
+
+def back_to_cards(timeout=25):
+    end = time.time() + timeout
+    while time.time() < end:
+        check()
+        if visible_cards():
+            return True
+        back = first_visible(BACK_BTN)
+        if back:
+            click(back)
+            log("terug")
+            pause(1.5)
+        else:
+            pause(0.5)
+    return False
+
+
+def wait_for_exercise(timeout=25):
+    end = time.time() + timeout
+    last_start = 0
+    while time.time() < end:
+        check()
+        if in_exercise():
+            return True
+        start = first_visible(START_BTN)
+        if start and time.time() - last_start > 5:
+            click(start)
+            log("start")
+            last_start = time.time()
+            pause(1)
+            continue
+        pause(0.5)
+    return False
+
+
+def enter_lesson(step, first):
+    if first and in_exercise():
+        return True
+    if not back_to_cards():
+        log("geen kaarten gevonden op de pagina")
+        return False
+
+    card, total = get_card(step["card"])
+    if card is None:
+        log("kaart " + str(step["card"] + 1) + " bestaat niet (" + str(total) + " kaarten gevonden), stop")
+        return False
+
+    log("open kaart " + str(step["card"] + 1) + " van " + str(total) + ": " + card_title(card))
+    try:
+        target = card.find_element(*CARD_INNER)
+    except NoSuchElementException:
+        target = card
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+    click(target)
+    pause(1)
+    return wait_for_exercise()
+
+
+def run_lesson(step):
+    dicts = [step["words"], all_words]
+    wait = WebDriverWait(driver, 15)
+    last = None
+    idle = 0
+    while idle < 30:
+        check()
+        try:
+            sb = stop_button()
+            if sb:
+                log("stop met oefenen: " + sb.text.strip())
+                click(sb)
+                pause(1)
+                return "finished"
+
+            btn = know_button()
+            if btn:
+                click(btn)
+                log("ik ken het")
+                last = None
+                idle = 0
+                pause(0.5)
+                continue
+
+            try:
+                cue = norm(get_cue())
+            except StaleElementReferenceException:
+                raise
+            except Exception:
+                cue = ""
+
+            if cue and cue != last:
+                options = mc_options()
+                if options:
+                    idx = pick_option(cue, options, dicts)
+                    if idx is None:
+                        idx = ask_mc(cue, [o[1] for o in options])
+                        if idx is None:
+                            return "quit"
+                        if idx < 0:
+                            last = cue
+                            idle = -40
+                            continue
+                    click(options[idx][0])
+                    log(cue + " -> " + options[idx][1] + " (mc)")
+                    last = cue
+                    idle = 0
+                    word_delay()
+                    continue
+
+                answer = lookup(cue, dicts)
+                if answer is None:
+                    answer = ask_open(cue)
+                    if answer is None:
+                        return "quit"
+                    if answer == "":
+                        last = cue
+                        idle = -40
+                        continue
+                box = wait.until(lambda d: d.find_element(*ANSWER))
+                box.click()
+                box.clear()
+                box.send_keys(answer)
+                box.send_keys(Keys.ENTER)
+                log(cue + " = " + answer)
+                last = cue
+                idle = 0
+                word_delay()
+                continue
+
+            if cue and cue == last:
+                nb = next_button()
+                if nb:
+                    click(nb)
+                    log("volgende")
+                    idle = 0
+                    for t in range(10):
+                        pause(0.3)
+                        try:
+                            if norm(get_cue()) != cue:
+                                break
+                        except Exception:
+                            break
+                    continue
+        except StaleElementReferenceException:
+            pause(0.3)
+            continue
+
+        idle += 1
+        pause(0.5)
+    return "idle"
+
+
+def run(steps):
+    global all_words
+    if not alive():
+        raise RuntimeError("browser is niet open")
+    all_words = {}
+    for s in steps:
+        for k, v in s["words"].items():
+            all_words.setdefault(k, v)
+    try:
+        for n in range(len(steps)):
+            step = steps[n]
+            log("=== " + step["label"] + " (" + str(n + 1) + "/" + str(len(steps)) + ") ===")
+            if not enter_lesson(step, n == 0):
+                log("kaart openen mislukt, stop")
+                return "error"
+            result = run_lesson(step)
+            if result == "finished":
+                log(step["label"] + " klaar")
+                continue
+            if result == "idle":
+                log("niks meer gezien, stop")
+            else:
+                log("gestopt")
+            return result
+        log("alle lijsten klaar")
+        return "done"
+    except Stopped:
+        log("gestopt")
+        return "stopped"
