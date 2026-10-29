@@ -21,7 +21,17 @@ def get_json(url):
     with urllib.request.urlopen(req, context=ctx, timeout=15) as r:
         return json.loads(r.read().decode("utf-8"))
 
-
+def describe(e):
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 404:
+            return "github 404: repo naam fout, repo is prive, of er is nog geen release"
+        if e.code == 403:
+            return "github 403: te veel checks, probeer later"
+        return "github fout " + str(e.code)
+    if isinstance(e, urllib.error.URLError):
+        return "geen internet of certificaat probleem: " + str(e.reason)
+    return type(e).__name__ + ": " + str(e)
+    
 def latest_release():
     rel = get_json("https://api.github.com/repos/" + REPO + "/releases/latest")
     if num(rel.get("tag_name", "")) > num(bot.APP_VERSION):

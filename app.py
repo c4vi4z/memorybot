@@ -385,9 +385,11 @@ class App:
     def check_updates(self, silent):
         try:
             rel = updater.latest_release()
-        except Exception:
+        except Exception as e:
+            msg = updater.describe(e)
+            self.log("update check: " + msg)
             if not silent:
-                self.q.put(("upd", None, "geen verbinding met github"))
+                self.q.put(("upd", None, msg))
             return
         if rel:
             self.q.put(("upd", rel, "update beschikbaar: " + str(rel.get("tag_name", "?"))))
