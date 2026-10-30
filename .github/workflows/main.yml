@@ -27,6 +27,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: build-${{ matrix.os }}
+          if-no-files-found: error
           path: |
             installer_out/*
             *.dmg
@@ -42,6 +43,10 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: flatten
+        run: |
+          find artifacts -mindepth 2 -type f -exec mv {} artifacts/ \;
+          ls -la artifacts
       - name: code.zip
         run: |
           VER="${TAG#v}"
