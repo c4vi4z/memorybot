@@ -52,7 +52,7 @@ except Exception:
 
 SETTINGS = os.path.join(bot_mod.BASE, "settings.json")
 ICON = os.path.join(bot_mod.RES, "icon.png")
-DEFAULT_URL = "https://SCHOOL.memorylab.app"
+DEFAULT_URL = "https://VERANDERSCHOOLHIER.memorylab.app"
 
 
 def load_settings():
