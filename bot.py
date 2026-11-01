@@ -33,7 +33,7 @@ PROFILE = os.path.join(PARENT, "chrome-profile")
 os.makedirs(LISTS_DIR, exist_ok=True)
 
 SKIP = "-- sla kaart over --"
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 INSTALLER_API = 99
 DELAY_MIN = 1
 DELAY_MAX = 10
@@ -108,7 +108,7 @@ def pause(secs):
     while time.time() < end:
         check()
         time.sleep(0.1)
-        
+
 def word_delay():
     pause(random.uniform(DELAY_MIN, DELAY_MAX))
 
@@ -328,6 +328,10 @@ def open_browser(url):
         opts = Options()
         opts.binary_location = CHROME_BIN
         opts.add_argument("--user-data-dir=" + PROFILE)
+        opts.add_argument("--lang=nl")
+        opts.add_argument("--force-device-scale-factor=1")
+        opts.add_argument("--start-maximized")
+        opts.add_experimental_option("prefs", {"intl.accept_languages": "nl,nl-NL,en"})
         last_err = None
         for attempt in range(2):
             kill_old_chrome()
@@ -346,6 +350,10 @@ def open_browser(url):
             raise RuntimeError(
                 "chrome starten mislukt. details in chromedriver.log (" + type(last_err).__name__ + ")"
             )
+        try:
+            driver.maximize_window()
+        except Exception:
+            pass
     driver.get(url)
 
 
@@ -449,12 +457,15 @@ def pick_option(cue, options, dicts):
 
 def visible_cards():
     out = []
-    for card in driver.find_elements(*LESSON_CARD):
-        try:
-            if card.is_displayed():
-                out.append(card)
-        except StaleElementReferenceException:
-            continue
+    for loc in (LESSON_CARD, CARD_INNER):
+        for card in driver.find_elements(*loc):
+            try:
+                if card.is_displayed():
+                    out.append(card)
+            except StaleElementReferenceException:
+                continue
+        if out:
+            break
     return out
 
 
@@ -529,6 +540,48 @@ def wait_for_exercise(timeout=25):
         pause(0.5)
     return False
 
+def dump_debug(why):
+    try:
+        log("debug: " + why)
+        log("  url: " + driver.current_url)
+        log("  titel: " + driver.title)
+        size = driver.get_window_size()
+        log("  venster: " + str(size["width"]) + "x" + str(size["height"]))
+        log("  taal: " + str(driver.execute_script("return navigator.language")))
+        log("  app-lesson-card in pagina: " + str(len(driver.find_elements(*LESSON_CARD))))
+        log("  ion-card lesson-card in pagina: " + str(len(driver.find_elements(*CARD_INNER))))
+        log("  zichtbaar: " + str(len(visible_cards())))
+        driver.save_screenshot(os.path.join(BASE, "debug.png"))
+        with open(os.path.join(BASE, "debug.html"), "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        log("  debug.png en debug.html staan in " + BASE)
+    except Exception as e:
+        log("debug mislukt: " + type(e).__name__)
+
+
+def enter_lesson(step, first):
+    if first and in_exercise():
+        return True
+    if not back_to_cards():
+        log("geen kaarten gevonden op de pagina")
+        dump_debug("geen kaarten na terug klikken")
+        return False
+
+    card, total = get_card(step["card"])
+    if card is None:
+        log("kaart " + str(step["card"] + 1) + " bestaat niet (" + str(total) + " zichtbaar), stop")
+        dump_debug("kaart " + str(step["card"] + 1) + " niet gevonden")
+        return False
+
+    log("open kaart " + str(step["card"] + 1) + " van " + str(total) + ": " + card_title(card))
+    try:
+        target = card.find_element(*CARD_INNER)
+    except NoSuchElementException:
+        target = card
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+    click(target)
+    pause(1)
+    return wait_for_exercise()
 
 def enter_lesson(step, first):
     if first and in_exercise():
